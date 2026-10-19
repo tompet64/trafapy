@@ -168,7 +168,6 @@ cython_debug/
 # Scripts/files
 interactive.py
 Makefile
-.github
 tests/test_real_api.py
 tests/test_my_functionality.py
 

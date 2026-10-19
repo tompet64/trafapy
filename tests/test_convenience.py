@@ -715,7 +715,8 @@ class TestRealWorldUsagePatterns:
             
             # Test data manipulation and export
             assert len(data) == 4
-            assert data["count"].dtype == object  # String data from API
+            # pandas 3 infers a string dtype; older pandas uses object.
+            assert pd.api.types.is_string_dtype(data["count"])
             
             # Convert to numeric for analysis
             data_numeric = data.copy()

@@ -31,14 +31,8 @@ tests/
 ### Install Test Dependencies
 
 ```bash
-# Essential test dependencies
-pip install pytest pytest-cov pytest-mock
-
-# Install your package in development mode
-pip install -e .
-
-# Optional: Install all development dependencies
-pip install -r requirements-test.txt
+# Install the package and all development dependencies
+python -m pip install -e ".[dev]"
 ```
 
 ### Run Basic Tests
@@ -59,6 +53,21 @@ pytest tests/test_rate_limiting.py -v
 # Run fast unit tests only (excludes performance tests)
 pytest -m "not integration and not slow" -v
 ```
+
+## Continuous Integration
+
+`.github/workflows/tests.yml` runs on every push and pull request using
+Python 3.10, 3.11, 3.12, and 3.13 on Ubuntu. It installs the `dev` extra from
+`pyproject.toml` and runs:
+
+```bash
+python -m pytest -m "not integration" --cov=trafapy --cov-report=term-missing
+```
+
+Tests marked `integration` are excluded because they can call the live
+Trafikanalys API. Mocked tests, including rate limiting and timing tests,
+remain enabled. CI does not publish packages. Older Python versions listed
+in the package metadata are not covered by this workflow.
 
 ## 🧪 Test Categories
 
@@ -180,7 +189,7 @@ pytest -k "cache and performance" -v
 ### Pytest Configuration (`pytest.ini`)
 
 ```ini
-[tool:pytest]
+[pytest]
 testpaths = tests
 markers =
     integration: marks tests as integration tests (may hit real API)
