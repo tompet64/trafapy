@@ -392,3 +392,34 @@ If you encounter testing issues:
 5. **Clean environment**: Remove cache and temporary files
 
 **Remember**: A passing test suite means your TrafaPy installation is working correctly! 🎉
+## Live API checks
+
+The separate **Live API integration tests** workflow calls the real Trafikanalys
+API using Python 3.12. Run it manually from Actions → Live API integration tests
+→ Run workflow. It also runs for pull requests and pushes to `main` that change
+the client, integration tests, shared test configuration or this workflow.
+The ordinary **Unit tests** workflow still excludes integration tests.
+
+Run the same checks locally with:
+
+```bash
+python -m pytest tests/test_trafapy.py -m integration -v --tb=short
+```
+
+There are three checks: the product catalogue must contain `t10011`; its metadata
+must include expected dimensions, measure and hierarchy plus usable direct
+`agarkat` options without the hierarchical fallback; and `t10011|ar:2023|itrfslut`
+must return one positive integer annual count for the requested year. No exact
+statistical count is hardcoded, so revisions do not cause a failure by themselves.
+
+The test client has no response cache or retries. HTTP requests have a 10-second
+connection timeout and a 30-second read timeout. HTTP errors, API `Errors`, empty
+results, missing fields and unexpected values fail the run; no exception is
+converted into a skipped test. A failed live run can mean an API outage or
+changed metadata as well as a client defect. Consult its failure log before
+attributing the cause. The workflow has a five-minute overall timeout and makes
+four normal API requests across its three tests.
+
+Live checks do not contribute to the offline coverage figure. Passing them
+establishes that these specific requests work at the time of the run; it does
+not validate all products or the statistical accuracy of the source data.
