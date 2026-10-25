@@ -159,65 +159,27 @@ class TestVariableExploration:
             shutil.rmtree(self.temp_dir, ignore_errors=True)
     
     @patch('trafapy.client.TrafikanalysClient._get_structure')
-    def test_explore_product_variables_hierarchical(self, mock_get_structure):
-        """Test exploring variables in hierarchical structure."""
-        mock_response = {
-            "StructureItems": [
-                {
-                    "Name": "t10016",
-                    "Label": "Personbilar",
-                    "Type": "P",
-                    "StructureItems": [
-                        {
-                            "Name": "ar",
-                            "Label": "År",
-                            "Type": "D",
-                            "Description": "Year variable",
-                            "DataType": "Time"
-                        },
-                        {
-                            "Name": "agare",
-                            "Label": "Ägare",
-                            "Type": "H",
-                            "StructureItems": [
-                                {
-                                    "Name": "agarkat",
-                                    "Label": "Ägarkategori",
-                                    "Type": "D",
-                                    "Description": "Owner category"
-                                }
-                            ]
-                        },
-                        {
-                            "Name": "bestand",
-                            "Label": "Bestånd",
-                            "Type": "M",
-                            "Description": "Stock measure"
-                        }
-                    ]
-                }
-            ]
-        }
-        mock_get_structure.return_value = mock_response
-        
-        variables_df = self.client.explore_product_variables("t10016")
-        
-        assert len(variables_df) == 4  # ar, agare, agarkat, bestand
-        
-        # Check variable types
+    def test_explore_product_variables_hierarchical(
+        self, mock_get_structure, captured_bus_structure
+    ):
+        """Captured product has top-level variables linked by ParentName."""
+        mock_get_structure.return_value = captured_bus_structure
+
+        variables_df = self.client.explore_product_variables("t10011")
+
+        assert len(variables_df) == 14
         variable_types = variables_df.set_index('name')['type'].to_dict()
         assert variable_types['ar'] == 'Variable'
         assert variable_types['agare'] == 'Hierarchy'
         assert variable_types['agarkat'] == 'Variable'
-        assert variable_types['bestand'] == 'Measure'
-        
-        # Check hierarchy relationships
+        assert variable_types['itrfslut'] == 'Measure'
         hierarchy_info = variables_df.set_index('name')['parent_hierarchy'].to_dict()
-        assert pd.isna(hierarchy_info['ar'])  # No parent
-        assert pd.isna(hierarchy_info['agare'])  # No parent (is hierarchy itself)
-        assert hierarchy_info['agarkat'] == 'agare'  # Child of agare hierarchy
-        assert pd.isna(hierarchy_info['bestand'])  # No parent
-    
+        assert pd.isna(hierarchy_info['ar'])
+        assert pd.isna(hierarchy_info['agare'])
+        assert hierarchy_info['agarkat'] == 'agare'
+        assert hierarchy_info['tillst'] == 'agare'
+        mock_get_structure.assert_called_once_with(query="t10011")
+
     @patch('trafapy.client.TrafikanalysClient._make_request')
     def test_explore_variable_options_direct_access(self, mock_request):
         """Test exploring variable options with direct access."""
@@ -252,49 +214,9 @@ class TestVariableExploration:
     
     @patch('trafapy.client.TrafikanalysClient._make_request')
     def test_explore_variable_options_fallback_to_hierarchical(self, mock_request):
-        """Test fallback to hierarchical approach when direct access fails."""
-        # First call (direct access) returns empty
-        # Second call (hierarchical) returns data
-        mock_request.side_effect = [
-            {"StructureItems": []},  # Direct access fails
-            {  # Hierarchical access succeeds
-                "StructureItems": [
-                    {
-                        "Name": "t10016",
-                        "Type": "P",
-                        "StructureItems": [
-                            {
-                                "Name": "agare",
-                                "Type": "H",
-                                "StructureItems": [
-                                    {
-                                        "Name": "agarkat",
-                                        "Type": "D",
-                                        "StructureItems": [
-                                            {"Name": "10", "Label": "Fysisk person", "Type": "DV"},
-                                            {"Name": "20", "Label": "Juridisk person", "Type": "DV"}
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            },
-            {  # Final hierarchical query
-                "StructureItems": [
-                    {
-                        "Name": "agarkat",
-                        "Type": "D",
-                        "StructureItems": [
-                            {"Name": "10", "Label": "Fysisk person", "Type": "DV"},
-                            {"Name": "20", "Label": "Juridisk person", "Type": "DV"}
-                        ]
-                    }
-                ]
-            }
-        ]
-        
+        """Defensive dispatch test; does not establish live fallback reachability."""
+        mock_request.return_value = {"StructureItems": []}
+
         with patch.object(self.client, '_explore_variable_options_hierarchical') as mock_hierarchical:
             mock_hierarchical.return_value = pd.DataFrame([
                 {"name": "10", "label": "Fysisk person", "option_type": "Value"},
@@ -306,6 +228,8 @@ class TestVariableExploration:
             assert len(options_df) == 2
             assert "10" in options_df["name"].values
             assert "20" in options_df["name"].values
+            mock_hierarchical.assert_called_once_with("t10016", "agarkat")
+            mock_request.assert_called_once()
 
 
 class TestDataProcessing:
