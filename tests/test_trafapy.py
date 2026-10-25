@@ -380,74 +380,106 @@ class TestTrafikanalysClient:
 
 
 class TestClientIntegration:
-    """Integration tests that may hit the real API (run with caution)."""
-    
+    """Small live API checks, selected separately with ``-m integration``."""
+
+    PRODUCT = "t10011"  # Buses; also used by the captured metadata regressions.
+    YEAR = "2023"       # Fixed historical period, not a moving "latest" value.
+
     @pytest.fixture
-    def client(self):
-        """Create client for integration tests."""
-        temp_dir = tempfile.mkdtemp()
+    def client(self, tmp_path, monkeypatch):
+        """Require fresh, bounded HTTP requests and fail on API-reported errors."""
         client = TrafikanalysClient(
             language="sv",
-            debug=False,
-            cache_enabled=True,
-            cache_dir=temp_dir,
-            cache_expiry_seconds=3600
+            cache_enabled=False,
+            cache_dir=str(tmp_path),
+            enable_retry=False,
         )
-        yield client
-        # Cleanup
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-    
+        original_get = client.session.get
+
+        def checked_get(url, **kwargs):
+            # The production client currently supplies no timeout. Bound only
+            # these live tests without changing the client's public behavior.
+            kwargs.setdefault("timeout", (10, 30))
+            response = original_get(url, **kwargs)
+            response.raise_for_status()
+            payload = response.json()
+            assert isinstance(payload, dict), "Expected an API response object"
+            assert not payload.get("Errors"), "API errors: {!r}".format(payload.get("Errors"))
+            return response
+
+        monkeypatch.setattr(client.session, "get", checked_get)
+        try:
+            yield client
+        finally:
+            client.session.close()
+
     @pytest.mark.integration
     def test_real_api_list_products(self, client):
-        """Test listing products with real API (marked as integration test)."""
-        products_df = client.list_products()
-        
-        assert isinstance(products_df, pd.DataFrame)
-        assert len(products_df) > 0
-        assert "code" in products_df.columns
-        assert "label" in products_df.columns
-        
-        # Check if we have some expected products
-        product_codes = products_df["code"].tolist()
-        assert any("t10016" in code or "t10026" in code for code in product_codes)
-    
+        """The catalogue must contain the exact product needed by these checks."""
+        products = client.list_products()
+
+        assert isinstance(products, pd.DataFrame)
+        assert not products.empty, "The live product catalogue is empty"
+        assert {"code", "label"}.issubset(products.columns)
+        assert products["code"].notna().all()
+        assert products["code"].is_unique, "Duplicate product codes in catalogue"
+        selected = products.loc[products["code"] == self.PRODUCT]
+        assert len(selected) == 1, "Expected product t10011 in the live catalogue"
+        assert selected["label"].notna().all()
+        assert selected["label"].str.strip().ne("").all()
+
     @pytest.mark.integration
     def test_real_api_explore_variables(self, client):
-        """Test exploring variables with real API."""
-        # Use a known product code (passenger cars)
-        product_code = "t10016"  # or t10026, depending on what's available
-        
-        variables_df = client.explore_product_variables(product_code)
-        
-        assert isinstance(variables_df, pd.DataFrame)
-        # Should have some variables
-        if len(variables_df) > 0:
-            assert "name" in variables_df.columns
-            assert "label" in variables_df.columns
-            assert "type" in variables_df.columns
-    
+        """Require D/M/H metadata and usable direct options for a hierarchy child."""
+        variables = client.explore_product_variables(self.PRODUCT)
+
+        assert isinstance(variables, pd.DataFrame)
+        assert not variables.empty, "The live product metadata is empty"
+        assert {"name", "label", "type", "parent_hierarchy"}.issubset(variables.columns)
+        assert variables["name"].is_unique
+        rows = variables.set_index("name")
+        expected_types = {
+            "ar": "Variable", "itrfslut": "Measure",
+            "agare": "Hierarchy", "agarkat": "Variable",
+        }
+        assert set(expected_types).issubset(rows.index)
+        for name, expected_type in expected_types.items():
+            assert rows.loc[name, "type"] == expected_type
+            assert pd.notna(rows.loc[name, "label"])
+            assert rows.loc[name, "label"].strip()
+        assert rows.loc["agarkat", "parent_hierarchy"] == "agare"
+
+        # Spy on the fallback rather than replacing it: a live direct lookup
+        # must work on its own, including recursive search within its response.
+        with patch.object(
+            client, "_explore_variable_options_hierarchical",
+            wraps=client._explore_variable_options_hierarchical,
+        ) as fallback:
+            options = client.explore_variable_options(self.PRODUCT, "agarkat")
+            fallback.assert_not_called()
+        assert not options.empty, "Direct hierarchy-child lookup returned no options"
+        assert {"name", "label", "option_type"}.issubset(options.columns)
+        values = options.loc[options["option_type"] == "Value"]
+        assert {"10", "20", "t1"}.issubset(set(values["name"]))
+        assert values["label"].notna().all()
+        assert values["label"].str.strip().ne("").all()
+
     @pytest.mark.integration
     def test_real_api_get_data_small(self, client):
-        """Test getting a small amount of real data."""
-        try:
-            # Use a known product and get a small dataset
-            product_code = "t10016"  # Passenger cars
-            variables = {
-                "ar": ["2023"],  # Just one recent year
-                "bestand": ""    # Stock data without filter
-            }
-            
-            df = client.get_data_as_dataframe(product_code, variables)
-            
-            assert isinstance(df, pd.DataFrame)
-            # Should have some data if the API works
-            if len(df) > 0:
-                assert "ar" in df.columns or any("ar" in str(col).lower() for col in df.columns)
-                
-        except Exception as e:
-            # If this specific product doesn't work, that's ok for the test
-            pytest.skip(f"API test failed, possibly due to product code change: {e}")
+        """A one-year national count must be nonempty, numeric and correctly selected."""
+        data = client.get_data_as_dataframe(
+            self.PRODUCT, {"ar": [self.YEAR], "itrfslut": ""}
+        )
+
+        assert isinstance(data, pd.DataFrame)
+        assert not data.empty, "The live statistics query returned no rows"
+        assert {"ar", "itrfslut"}.issubset(data.columns)
+        assert len(data) == 1, "Expected one national annual count"
+        assert data["ar"].astype(str).tolist() == [self.YEAR]
+        counts = pd.to_numeric(data["itrfslut"], errors="raise")
+        assert counts.notna().all(), "Missing count in live statistics response"
+        assert (counts > 0).all(), "Expected a positive bus count"
+        assert (counts % 1 == 0).all(), "Expected an integer count"
 
 
 class TestErrorHandling:
