@@ -76,8 +76,8 @@ def test_product_variables_follow_parent_name_and_preserve_hierarchy(
     }
     assert rows.loc["agarkat", "parent_hierarchy"] == "agare"
     assert rows.loc["tillst", "parent_hierarchy"] == "agare"
-    assert rows.loc["ar", "parent_hierarchy"] is None
-    assert rows.loc["agare", "parent_hierarchy"] is None
+    assert pd.isna(rows.loc["ar", "parent_hierarchy"])
+    assert pd.isna(rows.loc["agare", "parent_hierarchy"])
     assert rows.loc["agarkat", "label"] == "Ägarkategori"
     assert rows.loc["agarkat", "has_filter_options"]
     assert not rows.loc["agare", "has_filter_options"]
@@ -121,7 +121,7 @@ def test_direct_lookup_returns_exact_captured_options_without_fallback(
 
     result = client_no_cache.explore_variable_options(PRODUCT, variable)
 
-    assert result.to_dict("records") == expected
+    pd.testing.assert_frame_equal(result, pd.DataFrame(expected))
     request.assert_called_once_with(
         client_no_cache.BASE_URL + "/structure",
         {"query": PRODUCT + "|" + variable, "lang": "sv"},
