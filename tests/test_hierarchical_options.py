@@ -1,4 +1,12 @@
-"""Isolated tests for the hierarchical metadata fallback."""
+"""Regression tests using captured API structures, plus defensive error cases.
+
+Direct access includes recursive search within its response. It must not be
+confused with the separate hierarchical fallback. See fixtures/structure/README.md.
+"""
+
+import json
+from pathlib import Path
+from unittest.mock import Mock
 
 import pandas as pd
 import pytest
@@ -6,13 +14,22 @@ import pytest
 from trafapy.client import TrafikanalysClient
 
 
-PRODUCT = "t12345"
-VARIABLE = "kommun"
+PRODUCT = "t10011"
+FIXTURES = Path(__file__).parent / "fixtures" / "structure"
+
+
+def load_structure(variable=None):
+    suffix = "-" + variable if variable else ""
+    return json.loads((FIXTURES / (PRODUCT + suffix + ".json")).read_text(encoding="utf-8"))
 
 
 @pytest.fixture
-def client_no_cache(tmp_path):
-    """Build a client that cannot read or write a persistent cache."""
+def client_no_cache(tmp_path, monkeypatch):
+    """Isolate cache and fail immediately on accidental network access."""
+    def unexpected_network(*args, **kwargs):
+        pytest.fail("Captured-response tests must not access the network")
+
+    monkeypatch.setattr("requests.sessions.Session.request", unexpected_network)
     return TrafikanalysClient(
         cache_enabled=False,
         cache_dir=str(tmp_path),
@@ -20,282 +37,150 @@ def client_no_cache(tmp_path):
     )
 
 
-def structure_with_hierarchy():
-    return {
-        "StructureItems": [
-            {
-                "Type": "P",
-                "Name": PRODUCT,
-                "StructureItems": [
-                    {
-                        "Type": "H",
-                        "Name": "region",
-                        "StructureItems": [
-                            {
-                                "Type": "H",
-                                "Name": "län",
-                                "StructureItems": [
-                                    {"Type": "D", "Name": VARIABLE}
-                                ],
-                            }
-                        ],
-                    }
-                ],
-            }
-        ]
-    }
+def install_direct_response(monkeypatch, client, response):
+    request = Mock(return_value=response)
+    fallback = Mock(side_effect=AssertionError("Direct lookup must not use the fallback"))
+    monkeypatch.setattr(client, "_make_request", request)
+    monkeypatch.setattr(client, "_explore_variable_options_hierarchical", fallback)
+    return request, fallback
 
 
-def install_structure_mocks(monkeypatch, client, initial, hierarchical):
-    """Replace both structure reads and return the second response on demand."""
-    monkeypatch.setattr(client, "_get_structure", lambda query: initial)
-    request = {}
-
-    def fake_cached_request(**kwargs):
-        request.update(kwargs)
-        return hierarchical
-
-    monkeypatch.setattr("trafapy.client.cached_api_request", fake_cached_request)
-    return request
-
-
-def test_builds_nested_hierarchy_query_and_extracts_values_and_filters(
-    client_no_cache, monkeypatch
+def test_product_variables_follow_parent_name_and_preserve_hierarchy(
+    client_no_cache, monkeypatch, captured_bus_structure
 ):
-    client_no_cache.debug = True
-    response = {
-        "StructureItems": [
-            {
-                "Type": "H",
-                "Name": "result-root",
-                "StructureItems": [
-                    {
-                        "Type": "H",
-                        "Name": "result-branch",
-                        "StructureItems": [
-                            {
-                                "Type": "D",
-                                "Name": VARIABLE,
-                                "Label": "Kommun",
-                                "StructureItems": [
-                                    {"Type": "DV", "Name": "0180", "Label": "Stockholm"},
-                                    {
-                                        "Type": "F",
-                                        "Name": "alla",
-                                        "Label": "Samtliga kommuner",
-                                        "UniqueId": "filter-1",
-                                    },
-                                    {"Type": "X", "Name": "ignored", "Label": "Ignored"},
-                                ],
-                            }
-                        ],
-                    }
-                ],
-            }
-        ]
-    }
-    request = install_structure_mocks(
-        monkeypatch, client_no_cache, structure_with_hierarchy(), response
-    )
+    response = captured_bus_structure
+    product = next(item for item in response["StructureItems"] if item["Name"] == PRODUCT)
+    assert product["StructureItems"] == []
+    # A realistic sibling from another product must not leak into the result.
+    response["StructureItems"].append({
+        "Type": "D", "Name": "unrelated", "ParentName": "other-product",
+        "StructureItems": [],
+    })
+    request = Mock(return_value=response)
+    monkeypatch.setattr(client_no_cache, "_make_request", request)
 
-    result = client_no_cache._explore_variable_options_hierarchical(PRODUCT, VARIABLE)
+    result = client_no_cache.explore_product_variables(PRODUCT)
 
-    assert request["url"] == f"{client_no_cache.BASE_URL}/structure"
-    assert request["params"] == {
-        "query": f"{PRODUCT}|region|län|{VARIABLE}",
-        "lang": "sv",
-    }
-    assert result.to_dict("records") == [
-        {
-            "name": "0180",
-            "label": "Stockholm",
-            "description": "",
-            "option_type": "Value",
-            "unique_id": "",
-        },
-        {
-            "name": "alla",
-            "label": "Samtliga kommuner",
-            "description": "",
-            "option_type": "Filter",
-            "unique_id": "filter-1",
-        },
+    assert result["name"].tolist() == [
+        "ar", "avregform", "dimpo", "leasing", "bussklass", "drivm", "pass",
+        "itrfslut", "avstslut", "nyregunder", "avregunder", "agare", "agarkat", "tillst",
     ]
-
-
-def test_finds_variable_at_top_level_of_hierarchical_response(
-    client_no_cache, monkeypatch
-):
-    response = {
-        "StructureItems": [
-            {
-                "Name": VARIABLE,
-                "StructureItems": [{"Type": "DV", "Name": "0180", "Label": "Stockholm"}],
-            }
-        ]
+    rows = result.set_index("name")
+    assert rows["type"].to_dict() == {
+        **{name: "Variable" for name in [
+            "ar", "avregform", "dimpo", "leasing", "bussklass", "drivm", "pass",
+            "agarkat", "tillst",
+        ]},
+        **{name: "Measure" for name in ["itrfslut", "avstslut", "nyregunder", "avregunder"]},
+        "agare": "Hierarchy",
     }
-    install_structure_mocks(
-        monkeypatch, client_no_cache, structure_with_hierarchy(), response
+    assert rows.loc["agarkat", "parent_hierarchy"] == "agare"
+    assert rows.loc["tillst", "parent_hierarchy"] == "agare"
+    assert pd.isna(rows.loc["ar", "parent_hierarchy"])
+    assert pd.isna(rows.loc["agare", "parent_hierarchy"])
+    assert rows.loc["agarkat", "label"] == "Ägarkategori"
+    assert rows.loc["agarkat", "has_filter_options"]
+    assert not rows.loc["agare", "has_filter_options"]
+    assert not rows.loc["itrfslut", "has_filter_options"]
+    request.assert_called_once_with(
+        client_no_cache.BASE_URL + "/structure", {"query": PRODUCT, "lang": "sv"}
     )
-
-    result = client_no_cache._explore_variable_options_hierarchical(PRODUCT, VARIABLE)
-
-    assert result["name"].tolist() == ["0180"]
-    assert result["option_type"].tolist() == ["Value"]
-
-
-def test_finds_measure_inside_hierarchy(client_no_cache, monkeypatch):
-    initial = structure_with_hierarchy()
-    initial["StructureItems"][0]["StructureItems"][0]["StructureItems"][0][
-        "StructureItems"
-    ][0]["Type"] = "M"
-    response = {
-        "StructureItems": [
-            {"Name": VARIABLE, "StructureItems": [{"Type": "DV", "Name": "0180"}]}
-        ]
-    }
-    request = install_structure_mocks(monkeypatch, client_no_cache, initial, response)
-
-    result = client_no_cache._explore_variable_options_hierarchical(PRODUCT, VARIABLE)
-
-    assert request["params"]["query"] == f"{PRODUCT}|region|län|{VARIABLE}"
-    assert result["name"].tolist() == ["0180"]
 
 
 @pytest.mark.parametrize(
-    "initial",
+    "variable, expected",
     [
-        {},
-        {"StructureItems": []},
-        {"StructureItems": [{"Type": "P", "Name": PRODUCT}]},
-        {
-            "StructureItems": [
-                {
-                    "Type": "P",
-                    "Name": PRODUCT,
-                    "StructureItems": [{"Type": "H", "Name": "region", "StructureItems": []}],
-                }
-            ]
-        },
-        {
-            "StructureItems": [
-                {
-                    "Type": "P",
-                    "Name": PRODUCT,
-                    "StructureItems": [
-                        {
-                            "Type": "H",
-                            "Name": "region",
-                            "StructureItems": [
-                                {"Type": "M", "Name": "different_measure"}
-                            ],
-                        }
-                    ],
-                }
-            ]
-        },
-    ],
-    ids=[
-        "missing-structure-items",
-        "empty-structure",
-        "product-without-children",
-        "empty-hierarchy",
-        "hierarchy-without-requested-variable",
+        ("ar", [
+            {"name": "senaste", "label": "Senaste", "description": None,
+             "option_type": "Filter", "unique_id": "DarDVsenaste"},
+            {"name": "forra", "label": "Föregående", "description": None,
+             "option_type": "Filter", "unique_id": "DarDVforra"},
+        ] + [
+            {"name": str(year), "label": str(year), "description": "",
+             "option_type": "Value", "unique_id": "DarDV" + str(year)}
+            for year in range(2001, 2026)
+        ]),
+        ("agarkat", [
+            {"name": code, "label": label, "description": "",
+             "option_type": "Value", "unique_id": "DagarkatDV" + code}
+            for code, label in [("10", "Fysisk person"), ("20", "Juridisk person"), ("t1", "Totalt")]
+        ]),
+        ("tillst", [
+            {"name": code, "label": label, "description": "",
+             "option_type": "Value", "unique_id": "DtillstDV" + code}
+            for code, label in [("1", "Yrkesmässig trafik"), ("2", "Firmabilstrafik"), ("t1", "Totalt")]
+        ]),
     ],
 )
-def test_returns_empty_without_second_request_when_no_hierarchy_path(
-    client_no_cache, monkeypatch, initial
+def test_direct_lookup_returns_exact_captured_options_without_fallback(
+    client_no_cache, monkeypatch, variable, expected
 ):
-    def unexpected_request(**kwargs):
-        pytest.fail("A hierarchical API request should not be made without a path")
+    request, fallback = install_direct_response(
+        monkeypatch, client_no_cache, load_structure(variable)
+    )
 
-    monkeypatch.setattr(client_no_cache, "_get_structure", lambda query: initial)
-    monkeypatch.setattr("trafapy.client.cached_api_request", unexpected_request)
+    result = client_no_cache.explore_variable_options(PRODUCT, variable)
 
-    result = client_no_cache._explore_variable_options_hierarchical(PRODUCT, VARIABLE)
+    pd.testing.assert_frame_equal(result, pd.DataFrame(expected))
+    request.assert_called_once_with(
+        client_no_cache.BASE_URL + "/structure",
+        {"query": PRODUCT + "|" + variable, "lang": "sv"},
+    )
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("children", [[], None])
+def test_defensive_present_variable_without_options_does_not_trigger_fallback(
+    client_no_cache, monkeypatch, children
+):
+    """Derived error cases, not additional captured API responses."""
+    response = load_structure("ar")
+    variable = next(item for item in response["StructureItems"] if item["Name"] == "ar")
+    if children is None:
+        variable.pop("StructureItems")
+    else:
+        variable["StructureItems"] = children
+    request, fallback = install_direct_response(monkeypatch, client_no_cache, response)
+
+    result = client_no_cache.explore_variable_options(PRODUCT, "ar")
 
     assert isinstance(result, pd.DataFrame)
     assert result.empty
+    assert request.call_count == 1
+    fallback.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "response",
-    [
-        {},
-        {"StructureItems": []},
-        {
-            "StructureItems": [
-                {"Name": "other", "StructureItems": [{"Name": "nested-other"}]}
-            ]
-        },
-    ],
-    ids=["missing-structure-items", "empty-structure", "variable-not-found-recursively"],
-)
-def test_returns_empty_when_hierarchical_response_lacks_variable(
+@pytest.mark.parametrize("response", [{}, {"StructureItems": []}, {"StructureItems": [
+    {"Type": "P", "Name": PRODUCT, "StructureItems": []},
+]}], ids=["missing-structure", "empty-structure", "variable-absent"])
+def test_defensive_invalid_direct_response_dispatches_to_fallback(
     client_no_cache, monkeypatch, response
 ):
-    install_structure_mocks(
-        monkeypatch, client_no_cache, structure_with_hierarchy(), response
-    )
+    """Verify dispatch only; this does not establish live fallback reachability."""
+    request = Mock(return_value=response)
+    expected = pd.DataFrame([{"name": "sentinel"}])
+    fallback = Mock(return_value=expected)
+    monkeypatch.setattr(client_no_cache, "_make_request", request)
+    monkeypatch.setattr(client_no_cache, "_explore_variable_options_hierarchical", fallback)
 
-    result = client_no_cache._explore_variable_options_hierarchical(PRODUCT, VARIABLE)
+    result = client_no_cache.explore_variable_options(PRODUCT, "agarkat")
 
-    assert isinstance(result, pd.DataFrame)
-    assert result.empty
-
-
-def test_variable_without_children_returns_empty_options(client_no_cache, monkeypatch):
-    response = {"StructureItems": [{"Name": VARIABLE, "StructureItems": []}]}
-    install_structure_mocks(
-        monkeypatch, client_no_cache, structure_with_hierarchy(), response
-    )
-
-    result = client_no_cache._explore_variable_options_hierarchical(PRODUCT, VARIABLE)
-
-    assert isinstance(result, pd.DataFrame)
-    assert result.empty
+    assert result is expected
+    assert request.call_count == 1
+    fallback.assert_called_once_with(PRODUCT, "agarkat")
 
 
-def test_debug_messages_cover_hierarchical_fallback_outcomes(
-    client_no_cache, monkeypatch, capsys
+def test_defensive_fallback_cannot_build_path_from_captured_flat_product(
+    client_no_cache, monkeypatch
 ):
-    client_no_cache.debug = True
+    """Document its current limitation without claiming the live API uses it."""
+    request = Mock(return_value=load_structure())
+    monkeypatch.setattr(client_no_cache, "_make_request", request)
 
-    monkeypatch.setattr(client_no_cache, "_get_structure", lambda query: {})
-    client_no_cache._explore_variable_options_hierarchical(PRODUCT, VARIABLE)
+    result = client_no_cache._explore_variable_options_hierarchical(PRODUCT, "agarkat")
 
-    response = {
-        "StructureItems": [
-            {
-                "Name": "result-root",
-                "StructureItems": [
-                    {"Name": "other", "StructureItems": [{"Name": "nested-other"}]}
-                ],
-            }
-        ]
-    }
-    install_structure_mocks(
-        monkeypatch, client_no_cache, structure_with_hierarchy(), response
+    assert isinstance(result, pd.DataFrame)
+    assert result.empty
+    request.assert_called_once_with(
+        client_no_cache.BASE_URL + "/structure", {"query": PRODUCT, "lang": "sv"}
     )
-    client_no_cache._explore_variable_options_hierarchical(PRODUCT, VARIABLE)
-
-    install_structure_mocks(
-        monkeypatch,
-        client_no_cache,
-        structure_with_hierarchy(),
-        {"StructureItems": [{"Name": VARIABLE, "StructureItems": []}]},
-    )
-    client_no_cache._explore_variable_options_hierarchical(PRODUCT, VARIABLE)
-
-    install_structure_mocks(
-        monkeypatch, client_no_cache, structure_with_hierarchy(), {}
-    )
-    client_no_cache._explore_variable_options_hierarchical(PRODUCT, VARIABLE)
-
-    output = capsys.readouterr().out
-    assert "No hierarchy path found" in output
-    assert "Using hierarchical query" in output
-    assert "Variable kommun not found in hierarchical API response" in output
-    assert "No filter options found for this variable" in output
-    assert "Found variable in hierarchical response" in output
-    assert "No 'StructureItems' in hierarchical API response" in output

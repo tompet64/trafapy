@@ -95,3 +95,13 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "unit: marks tests as unit tests"
     )
+
+
+@pytest.fixture
+def captured_bus_structure():
+    """Fresh copy of the full t10011 structure captured on 2026-10-25."""
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).parent / "fixtures" / "structure" / "t10011.json"
+    return json.loads(path.read_text(encoding="utf-8"))
