@@ -11,6 +11,23 @@ from .cache_utils import APICache, cached_api_request, DEFAULT_CACHE_DIR
 
 logger = logging.getLogger(__name__)
 
+
+class APIResponseError(RuntimeError):
+    """Raised when the Trafikanalys API returns an unsuccessful response."""
+
+
+class BatchRequestError(RuntimeError):
+    """Raised when one or more batches fail and a complete result is unavailable."""
+
+    def __init__(self, message: str, partial_result: Optional[pd.DataFrame] = None,
+                 failed_batches: Optional[List[Dict[str, Any]]] = None):
+        super().__init__(message)
+        self.partial_result = partial_result
+        self.failed_batches = failed_batches or []
+        if self.partial_result is not None:
+            self.partial_result.attrs["incomplete"] = True
+            self.partial_result.attrs["failed_batches"] = self.failed_batches
+
 def rate_limit(calls_per_second: float = 1.0):
     """
     Decorator to rate limit function calls.
@@ -216,10 +233,24 @@ class TrafikanalysClient:
                 raise requests.exceptions.RequestException(f"Rate limited (HTTP 429)", response=response)
             elif response.status_code >= 500:
                 raise requests.exceptions.RequestException(f"Server error ({response.status_code})", response=response)
-            
-            return {}
-        
-        return response.json()
+
+            raise APIResponseError(
+                f"Trafikanalys API request failed with HTTP {response.status_code}"
+            )
+
+        data = response.json()
+        self._validate_api_response(data)
+        return data
+
+    @staticmethod
+    def _validate_api_response(data: Any) -> Dict[str, Any]:
+        """Reject API-level errors before they can be used or cached as data."""
+        if not isinstance(data, dict):
+            raise APIResponseError("Trafikanalys API response must be a JSON object")
+        errors = data.get("Errors")
+        if errors:
+            raise APIResponseError(f"Trafikanalys API reported errors: {errors!r}")
+        return data
     
     def _make_request(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -501,6 +532,10 @@ class TrafikanalysClient:
             params={"query": query, "lang": self.language},
             debug=self.debug
         )
+
+        # Also validate cache hits: a bad response written by an older client
+        # must not become a statistical result after upgrading.
+        data = self._validate_api_response(data)
         
         if self.debug and 'Rows' in data:
             print(f"Got {len(data['Rows'])} rows from API")
@@ -611,7 +646,8 @@ class TrafikanalysClient:
         return pd.DataFrame(processed_rows)
     
     def get_data_as_dataframe(self, product_code: str, variables: Dict[str, Union[str, List[str]]], 
-                            use_batching: bool = True, show_progress: bool = True) -> pd.DataFrame:
+                            use_batching: bool = True, show_progress: bool = True,
+                            allow_partial: bool = False) -> pd.DataFrame:
         """
         Get data from the API as a DataFrame with automatic batching for large queries.
         
@@ -620,6 +656,8 @@ class TrafikanalysClient:
             variables: Dictionary of variables and values (e.g., {"ar": ["2020", "2021"]})
             use_batching: Whether to use automatic batching for large queries
             show_progress: Whether to show progress messages (True by default, can be overridden by debug mode)
+            allow_partial: If True, return successful batches after failures and mark the
+                DataFrame with ``attrs['incomplete']`` and ``attrs['failed_batches']``.
             
         Returns:
             DataFrame with the data
@@ -632,7 +670,7 @@ class TrafikanalysClient:
                 print(f"📊 Large query detected - retrieving data in {len(batches)} batches...")
             
             all_dataframes = []
-            total_rows = 0
+            failed_batches = []
             
             for i, batch_vars in enumerate(batches):
                 batch_num = i + 1
@@ -649,8 +687,6 @@ class TrafikanalysClient:
                     if not df.empty:
                         all_dataframes.append(df)
                         batch_rows = len(df)
-                        total_rows += batch_rows
-                        
                         if show_progress or self.debug:
                             print(f" ✅ {batch_rows:,} rows")
                     else:
@@ -660,13 +696,14 @@ class TrafikanalysClient:
                             print(f"Batch {batch_num} returned no data")
                             
                 except Exception as e:
+                    failed_batches.append({"batch": batch_num, "error": str(e)})
                     if show_progress or self.debug:
                         print(f" ❌ Error: {str(e)[:50]}...")
                     elif self.debug:
                         print(f"Batch {batch_num} failed: {e}")
                     continue
             
-            if not all_dataframes:
+            if not all_dataframes and not failed_batches:
                 if show_progress or self.debug:
                     print("❌ No data returned from any batch")
                 return pd.DataFrame()
@@ -675,7 +712,8 @@ class TrafikanalysClient:
             if show_progress or self.debug:
                 print(f"  🔗 Combining data from {len(all_dataframes)} successful batches...", end="")
             
-            result_df = pd.concat(all_dataframes, ignore_index=True)
+            result_df = (pd.concat(all_dataframes, ignore_index=True)
+                         if all_dataframes else pd.DataFrame())
             
             # Remove duplicates that might occur due to overlapping batches
             initial_rows = len(result_df)
@@ -684,13 +722,32 @@ class TrafikanalysClient:
             
             # Show completion message
             if show_progress or self.debug:
-                print(f" ✅")
+                print(" ✅" if not failed_batches else " ⚠️")
                 if initial_rows != final_rows:
                     print(f"  🧹 Removed {initial_rows - final_rows:,} duplicate rows")
-                print(f"✅ Batch processing complete! Retrieved {final_rows:,} total rows")
+                if failed_batches:
+                    print(
+                        f"⚠️ Batch processing incomplete: {len(failed_batches)} of "
+                        f"{len(batches)} batches failed; {final_rows:,} rows collected"
+                    )
+                else:
+                    print(f"✅ Batch processing complete! Retrieved {final_rows:,} total rows")
             elif self.debug:
                 print(f"Combined {len(batches)} batches into {final_rows} total rows")
             
+            if failed_batches:
+                if not allow_partial:
+                    raise BatchRequestError(
+                        f"{len(failed_batches)} of {len(batches)} data batches failed; "
+                        "refusing to return an incomplete result",
+                        partial_result=result_df,
+                        failed_batches=failed_batches,
+                    )
+                result_df.attrs["incomplete"] = True
+                result_df.attrs["failed_batches"] = failed_batches
+            else:
+                result_df.attrs["incomplete"] = False
+
             return result_df
         
         else:

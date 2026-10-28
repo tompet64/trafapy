@@ -8,7 +8,7 @@ large queries into smaller chunks to avoid URL length limits and improve perform
 import pytest
 import pandas as pd
 from unittest.mock import Mock, patch, MagicMock
-from trafapy import TrafikanalysClient
+from trafapy import TrafikanalysClient, BatchRequestError
 
 
 class TestBatchingMechanism:
@@ -254,8 +254,8 @@ class TestBatchingRetrieval:
         assert len(df) == 1
     
     @patch.object(TrafikanalysClient, '_get_data')
-    def test_batch_error_handling(self, mock_get_data):
-        """Test error handling during batched requests."""
+    def test_batch_error_rejects_partial_result_by_default(self, mock_get_data):
+        """A failed batch must not silently produce a complete-looking frame."""
         # Mock: first batch succeeds, second batch fails
         mock_response_1 = {
             'Rows': [
@@ -280,20 +280,46 @@ class TestBatchingRetrieval:
             'nyregunder': ''
         }
         
-        # Get data with batching - should handle partial failure gracefully
-        df = self.client.get_data_as_dataframe(
-            'test_product', 
-            variables, 
-            use_batching=True,
-            show_progress=False
-        )
-        
-        # Should have attempted 2 calls
+        with pytest.raises(BatchRequestError) as exc_info:
+            self.client.get_data_as_dataframe(
+                'test_product', variables, use_batching=True, show_progress=False
+            )
+
         assert mock_get_data.call_count == 2
-        
-        # Should return data from successful batch only
+        assert exc_info.value.failed_batches == [{"batch": 2, "error": "API Error"}]
+        assert len(exc_info.value.partial_result) == 1
+        assert exc_info.value.partial_result.iloc[0]['ar'] == '2020'
+        assert exc_info.value.partial_result.attrs['incomplete'] is True
+
+    @patch.object(TrafikanalysClient, '_get_data')
+    def test_batch_error_can_return_explicitly_marked_partial_result(self, mock_get_data):
+        """Partial data requires opt-in and carries machine-readable incompleteness."""
+        mock_get_data.side_effect = [
+            {'Rows': [{'Cell': [
+                {'Column': 'ar', 'Value': '2020'},
+                {'Column': 'nyregunder', 'Value': '100'}
+            ]}]},
+            RuntimeError("API Error"),
+        ]
+        df = self.client.get_data_as_dataframe(
+            'test_product', {'ar': ['2020', '2021', '2022', '2023'], 'nyregunder': ''},
+            use_batching=True, show_progress=False, allow_partial=True
+        )
+
         assert len(df) == 1
-        assert df.iloc[0]['ar'] == '2020'
+        assert df.attrs['incomplete'] is True
+        assert df.attrs['failed_batches'][0]['batch'] == 2
+
+    @patch.object(TrafikanalysClient, '_get_data')
+    def test_successful_empty_batches_are_a_valid_empty_selection(self, mock_get_data):
+        mock_get_data.return_value = {'Rows': []}
+        df = self.client.get_data_as_dataframe(
+            'test_product', {'ar': ['2020', '2021', '2022', '2023'], 'nyregunder': ''},
+            use_batching=True, show_progress=False
+        )
+
+        assert df.empty
+        assert df.attrs.get('incomplete', False) is False
     
     @patch.object(TrafikanalysClient, '_get_data')
     def test_duplicate_removal_in_batches(self, mock_get_data):
