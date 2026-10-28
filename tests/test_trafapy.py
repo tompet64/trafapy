@@ -21,7 +21,7 @@ from unittest.mock import Mock, patch, MagicMock
 from typing import Dict, Any
 
 # Import the modules we're testing
-from trafapy.client import TrafikanalysClient
+from trafapy.client import TrafikanalysClient, APIResponseError
 from trafapy.cache_utils import APICache, cached_api_request
 
 
@@ -194,8 +194,27 @@ class TestTrafikanalysClient:
         url = "https://api.trafa.se/api/structure"
         params = {"lang": "sv"}
         
-        result = self.client._make_request(url, params)
-        assert result == {}
+        with pytest.raises(APIResponseError, match="HTTP 404"):
+            self.client._make_request(url, params)
+
+    @patch('requests.Session.get')
+    def test_make_request_rejects_api_errors_in_http_200(self, mock_get):
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"Rows": [], "Errors": ["Invalid selection"]}
+        mock_get.return_value = mock_response
+
+        with pytest.raises(APIResponseError, match="Invalid selection"):
+            self.client._make_request("https://api.trafa.se/api/data", {"query": "bad"})
+
+    def test_data_request_rejects_cached_api_error_response(self):
+        url = f"{self.client.BASE_URL}/data"
+        params = {"query": "t10011|ar:2020", "lang": "sv"}
+        key = self.client.cache.generate_cache_key(url, params)
+        self.client.cache.save_to_cache(key, {"Rows": [], "Errors": ["Invalid selection"]})
+
+        with pytest.raises(APIResponseError, match="Invalid selection"):
+            self.client._get_data(params["query"])
     
     def test_build_query(self):
         """Test query building functionality."""
